@@ -12,15 +12,21 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 const twilio = require('twilio');
+const sheetdbNode = require('sheetdb-node');
 
 // Load environment variables
 dotenv.config();
-const PROJECT_ID = 'simplytr-uutw'; // Replace with your Dialogflow project ID
+const PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID || 'simplytr-uutw';
 
 // Twilio Configuration
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_TOKEN;
 const twilioClient = twilio(accountSid, authToken);
+
+// SheetDB Configuration
+const sheetdbClient = sheetdbNode({ 
+    address: process.env.SHEETDB_API_ADDRESS 
+});
 
 const app = express();
 
@@ -38,8 +44,26 @@ const processContent = (content) => {
     return content
         .trim()
         .replace(/\s+/g, ' ')
-        .replace(/[^\w\s.,!?()-]/g, ''); // Remove unwanted special characters
+        .replace(/[^\w\s.,!?()-]/g, '');
 };
+
+// SheetDB Service
+class SheetDBService {
+    constructor(client) {
+        this.client = client;
+    }
+
+    async addUnresolvedQuery(data) {
+        try {
+            const response = await this.client.create(data);
+            console.log('Query saved to SheetDB:', response);
+            return response;
+        } catch (error) {
+            console.error('Error saving to SheetDB:', error);
+            throw error;
+        }
+    }
+}
 
 // PDF Chatbot Class
 class PDFChatbot {
@@ -127,7 +151,7 @@ class PDFChatbot {
                * Acknowledge the issue and suggest seeking legal help if the context doesn't contain detailed information.
                * Use a response like: "It seems like you need legal assistance regarding deportation. Please consult a lawyer specializing in deportation matters."
                
-            - If the query is asking about the chatbot itself, such as "What is this chatbot about?" or "What can this chatbot do?", and the context contains information about the chatbot’s purpose or functionality, provide a clear description of the chatbot's role or capabilities based on the context.
+            - If the query is asking about the chatbot itself, such as "What is this chatbot about?" or "What can this chatbot do?", and the context contains information about the chatbot's purpose or functionality, provide a clear description of the chatbot's role or capabilities based on the context.
         
             Constraints:
             - Do not reference the source document.
@@ -150,21 +174,6 @@ class PDFChatbot {
         }
     }
 }
-
-const PDF_PATH = path.join(__dirname, 'faqs.pdf');
-let pdfChatbot;
-
-// Load PDF on Startup
-(async () => {
-    try {
-        pdfChatbot = new PDFChatbot();
-        await pdfChatbot.loadAndProcessPDF(PDF_PATH);
-        console.log('PDF Processing Complete');
-    } catch (error) {
-        console.error('Critical Error during initial PDF processing:', error);
-        process.exit(1);
-    }
-})();
 
 // Dialogflow Integration
 const sessionClient = new dialogflow.SessionsClient();
@@ -195,6 +204,25 @@ async function sendToDialogflow(message, sessionId) {
         throw error;
     }
 }
+
+const PDF_PATH = path.join(__dirname, 'faqs.pdf');
+let pdfChatbot;
+let sheetdbService;
+
+// Load PDF and Initialize Services on Startup
+(async () => {
+    try {
+        pdfChatbot = new PDFChatbot();
+        await pdfChatbot.loadAndProcessPDF(PDF_PATH);
+        
+        sheetdbService = new SheetDBService(sheetdbClient);
+        
+        console.log('PDF Processing and SheetDB Service Initialized');
+    } catch (error) {
+        console.error('Critical Error during initialization:', error);
+        process.exit(1);
+    }
+})();
 
 // Twilio Webhook
 app.post('/twilio-webhook', async (req, res) => {
@@ -227,26 +255,62 @@ app.post('/dialogflow-webhook', async (req, res) => {
     console.log('Dialogflow Request:', JSON.stringify(req.body, null, 2));
 
     try {
-        if (!pdfChatbot) {
-            return res.status(503).send('Chatbot not initialized');
+        if (!pdfChatbot || !sheetdbService) {
+            return res.status(503).send('Services not initialized');
         }
 
         const agent = new WebhookClient({ request: req, response: res });
         const intentName = agent.intent || req.body.queryResult.intent.displayName;
+        const userQuery = agent.query || req.body.queryResult.queryText || 'No query found';
+        const sessionId = req.body.session.split('/').pop();
 
         const handleWelcomeIntent = (agent) => {
             agent.add('Hi there! How can I assist you today?');
         };
 
         const handleFallbackIntent = async (agent) => {
-            const userQuery = agent.query || req.body.queryResult.queryText || 'No query found';
-
             try {
                 const result = await pdfChatbot.queryPDF(userQuery);
-                agent.add(result.answer || 'Sorry, I couldn\'t find relevant information.');
+                
+                if (result.answer.includes("I do not have enough information")) {
+                    // Trigger information collection
+                    agent.add('I couldn\'t find an answer to your question. Could you please provide your email? We\'ll get back to you with more information.');
+                    
+                    // Store context for follow-up
+                    agent.setContext({
+                        name: 'awaiting_user_info',
+                        lifespan: 2,
+                        parameters: {
+                            original_query: userQuery
+                        }
+                    });
+                } else {
+                    agent.add(result.answer);
+                }
             } catch (error) {
                 console.error('Error processing PDF query:', error);
                 agent.add('Sorry, I couldn\'t process your request right now.');
+            }
+        };
+
+        const handleUserInfoIntent = async (agent) => {
+            const name = agent.parameters.name;
+            const email = agent.parameters.email;
+            const originalQuery = agent.getContext('awaiting_user_info')?.parameters?.original_query || 'N/A';
+
+            try {
+                // Save to SheetDB
+                await sheetdbService.addUnresolvedQuery({
+                    name: name,
+                    email: email,
+                    query: originalQuery,
+                    timestamp: new Date().toISOString()
+                });
+
+                agent.add(`Thank you, We've recorded your query and will follow up via email.`);
+            } catch (error) {
+                console.error('Error saving user info:', error);
+                agent.add('Sorry, there was an issue saving your information. Please try again later.');
             }
         };
 
@@ -254,6 +318,7 @@ app.post('/dialogflow-webhook', async (req, res) => {
         intentMap.set('Default Welcome Intent', handleWelcomeIntent);
         intentMap.set('Default Fallback Intent', handleFallbackIntent);
         intentMap.set('PDF_Query_Intent', handleFallbackIntent);
+        intentMap.set('Collect_User_Info', handleUserInfoIntent);
 
         agent.handleRequest(intentMap);
     } catch (error) {
